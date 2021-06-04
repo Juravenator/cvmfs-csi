@@ -1,0 +1,12 @@
+{{- range $repo := .Values.repositories -}}
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: {{ $repo }}
+provisioner: {{ $.Values.csiPlugin.driverName }}
+reclaimPolicy: Delete
+volumeBindingMode: Immediate
+parameters:
+  repository: {{ $repo }}
+---
+{{ end }}

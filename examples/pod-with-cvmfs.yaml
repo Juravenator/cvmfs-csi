@@ -1,0 +1,21 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: cvmfs-example
+spec:
+  containers:
+  - name: my-container
+    image: cern/c8-base
+    command: [ "sleep", "Infinity" ]
+    volumeMounts:
+    - mountPath: "/cvmfs/dunedaq.opensciencegrid.org"
+      name: dunedaq
+    - mountPath: "/cvmfs/cms.cern.ch"
+      name: cms
+  volumes:
+  - name: dunedaq
+    persistentVolumeClaim:
+      claimName: dunedaq.opensciencegrid.org
+  - name: cms
+    persistentVolumeClaim:
+      claimName: cms.cern.ch

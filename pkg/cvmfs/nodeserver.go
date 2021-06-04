@@ -16,216 +16,252 @@
 package cvmfs
 
 import (
+	"bytes"
 	"context"
+	"fmt"
+	"io"
 	"os"
+	"text/template"
 
-	"github.com/golang/glog"
+	_ "embed"
+
+	"github.com/cernops/cvmfs-csi/internal"
+	"github.com/container-storage-interface/spec/lib/go/csi"
+	"github.com/rs/zerolog"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
-
-	"github.com/container-storage-interface/spec/lib/go/csi"
-	csicommon "github.com/kubernetes-csi/drivers/pkg/csi-common"
 )
 
-type nodeServer struct {
-	*csicommon.DefaultNodeServer
-}
+//go:embed cvmfsconf.go.tpl
+var localConfTemplateStr string
+var localConfTemplate = template.Must(template.New("default.local").Parse(localConfTemplateStr))
 
-func (ns *nodeServer) NodeStageVolume(ctx context.Context, req *csi.NodeStageVolumeRequest) (*csi.NodeStageVolumeResponse, error) {
-	if err := validateNodeStageVolumeRequest(req); err != nil {
-		glog.Errorf("failed to validate NodeStageVolumeRequest: %v", err)
-		return nil, status.Error(codes.InvalidArgument, err.Error())
+func (d *Driver) BasicSetup() error {
+	log := internal.GetLogger("BasicSetup")
+
+	// we need the cache folder before we can mount anything
+	if err := mkdir(d.config.CacheFolder); err != nil {
+		return fmt.Errorf("cannot create cache root folder %s: %w", d.config.CacheFolder, err)
 	}
 
-	// Configuration
+	// The config repository needs to be mounted before any other
+	configPath := CVMFSConfigRepo.getMountPath()
+	if err := mkdir(configPath); err != nil {
+		return fmt.Errorf("cannot create config repository folder %s: %w", CVMFSConfigRepo, err)
+	}
 
-	stagingTargetPath := req.GetStagingTargetPath()
-	volId := volumeID(req.GetVolumeId())
-
-	volOptions, err := newVolumeOptions(req.GetVolumeContext())
+	mounted, err := folderIsMounted(configPath)
 	if err != nil {
-		glog.Errorf("invalid volume attributes for volume %s: %v", volId, err)
-		return nil, status.Error(codes.InvalidArgument, err.Error())
+		return fmt.Errorf("cannot check if config folder is mounted: %w", err)
 	}
 
+	if mounted {
+		log.Debug().Str("path", configPath).Msg("config repository already mounted")
+		return nil
+	} else {
+		// delete default.local
+		// it contains config that will mess up our bootstrap mount
+		log.Debug().Str("path", CVMFSLocalConfigFile).Msg("deleting local config file")
+		os.Remove(CVMFSLocalConfigFile)
 
-	base := "/cvmfs/"+string(volOptions.Repository)
-
-
-	if err = createMountPoint(base); err != nil {
-		glog.Errorf("failed to create staging mount point at %s for volume %s: %v", base, volId, err)
-		return nil, status.Error(codes.Internal, err.Error())
-	}
-
-	// Check if the volume is already mounted
-
-	isMnt, err := isMountPoint(base)
-
-	if err != nil {
-		glog.Errorf("stat failed: %v", err)
-		return nil, status.Error(codes.Internal, err.Error())
-	}
-
-	if !isMnt {
-		// It's not, mount now
-		if err = mountCvmfs(volOptions, volId, base); err != nil {
-			glog.Errorf("failed to mount volume %s to %s: %v", volId, base, err)
-			return nil, status.Error(codes.Internal, err.Error())
+		if err := MountCVMFS(CVMFSConfigRepo); err != nil {
+			return err
 		}
 	}
 
-	if err = createMountPoint(stagingTargetPath); err != nil {
-		glog.Errorf("failed to create staging mount point at %s for volume %s: %v", stagingTargetPath, volId, err)
-		return nil, status.Error(codes.Internal, err.Error())
+	// create default.local
+	if _, err := os.Stat(CVMFSLocalConfigFile); os.IsNotExist(err) {
+		log.Debug().Str("path", CVMFSLocalConfigFile).Msg("creating local config file")
+		f, err := os.Create(CVMFSLocalConfigFile)
+		if err != nil {
+			return fmt.Errorf("cannot create local config file %s: %w", CVMFSLocalConfigFile, err)
+		}
+		var tpl bytes.Buffer
+		wr := io.MultiWriter(f, &tpl)
+		if err := localConfTemplate.Execute(wr, d.config); err != nil {
+			log.Error().Err(err).Str("path", f.Name()).Msg("config file generation failed")
+			return fmt.Errorf("unable to write local config file %s: %w", CVMFSLocalConfigFile, err)
+		}
+		log.Debug().Str("path", f.Name()).Bytes("content", tpl.Bytes()).Msg("config file written")
 	}
 
-	confData := cvmfsConfigData{
-		VolumeId: volId,
-		Tag:      volOptions.Tag,
-		Hash:     volOptions.Hash,
-		Proxy:    volOptions.Proxy,
+	return nil
+}
+
+// NodeStageVolume is called to mount a volume in a 'staging' location, a folder somewhere on the node.
+// This staging folder can be used by many pods simultaneously, since we mount readonly.
+// This driver creates one cvmfs mount per StorageClass, which represents a unique configuration of
+// repository and tag/hash.
+func (d *Driver) NodeStageVolume(ctx context.Context, req *csi.NodeStageVolumeRequest) (*csi.NodeStageVolumeResponse, error) {
+	log := zerolog.Ctx(ctx).With().Str("volumeid", req.GetVolumeId()).Logger()
+	log.Trace().Interface("req", req).Msg("NodeStageVolume")
+
+	// check if this request is valid for this driver
+	if err := validateNodeStageVolumeRequest(req); err != nil {
+		return nil, status.Error(codes.InvalidArgument, fmt.Sprintf("failed to validate NodeStageVolumeRequest: %v", err))
 	}
 
-	if err := confData.writeToFile(); err != nil {
-		glog.Errorf("failed to write cvmfs config for volume %s: %v", volId, err)
-		return nil, status.Error(codes.Internal, err.Error())
+	if err := d.BasicSetup(); err != nil {
+		return nil, status.Error(codes.Internal, fmt.Sprintf("failed to perform basic setup: %v", err))
 	}
 
-	if err := createVolumeCache(volId); err != nil {
-		glog.Errorf("failed to create cache for volume %s: %v", volId, err)
-	}
-
-	// Check if the volume is already mounted
-
-	isMnt, err = isMountPoint(stagingTargetPath)
-
+	/*
+	 * get parameters
+	 */
+	log.Trace().Interface("volumecontext", req.GetVolumeContext()).Msg("parsing volumecontext")
+	repository, err := RepositoryFromContext(req.GetVolumeContext())
 	if err != nil {
-		glog.Errorf("stat failed: %v", err)
-		return nil, status.Error(codes.Internal, err.Error())
+		return nil, status.Error(codes.InvalidArgument, fmt.Sprintf("cannot parse volume options: %v", err))
+	}
+	to := repository.getMountPath()
+	log = log.With().Str("to", to).Str("repository", string(repository)).Logger()
+
+	/*
+	 * mount cvmfs folder if needed
+	 */
+	if err := mkdir(to); err != nil {
+		return nil, status.Error(codes.Internal, fmt.Sprintf("cannot create CVMFS folder %s: %v", to, err))
 	}
 
-	if isMnt {
-		glog.Infof("cvmfs: volume %s is already mounted to %s, skipping", volId, stagingTargetPath)
-		return &csi.NodeStageVolumeResponse{}, nil
+	log.Trace().Msg("checking if volume is already mounted")
+	mounted, err := folderIsMounted(to)
+	if err != nil {
+		return nil, status.Error(codes.Internal, fmt.Sprintf("cannot probe if folder is already mounted %s: %v", to, err))
 	}
 
-	// It's not, mount now
+	if mounted {
+		log.Debug().Msg("volume already mounted")
+	} else {
+		log.Debug().Msg("mounting volume")
+		err = MountCVMFS(repository)
+		if err != nil {
+			return nil, status.Error(codes.Internal, fmt.Sprintf("cannot mount volume: %v", err))
+		}
 
-	if err = bindMount(base, stagingTargetPath); err != nil {
-		glog.Errorf("failed to bind-mount %s to %s: %v", base, stagingTargetPath, err)
-		return nil, status.Error(codes.Internal, err.Error())
+		log.Info().Msg("volume mounted")
 	}
 
-	glog.Infof("cvmfs: successfuly mounted volume %s to %s", volId, stagingTargetPath)
+	/*
+	 * bind mount to requested folder
+	 */
+	stagingTargetPath := req.GetStagingTargetPath()
+	log = log.With().Str("stagingpath", stagingTargetPath).Logger()
+
+	err = mkdir(stagingTargetPath)
+	if err != nil {
+		return nil, status.Error(codes.Internal, fmt.Sprintf("cannot create staging folder %s: %v", stagingTargetPath, err))
+	}
+
+	log.Trace().Msg("checking if staging path is already mounted")
+	mounted, err = folderIsMounted(stagingTargetPath)
+	if err != nil {
+		return nil, status.Error(codes.Internal, fmt.Sprintf("cannot probe if staging folder is already mounted %s: %v", stagingTargetPath, err))
+	}
+
+	if mounted {
+		log.Debug().Msg("staging path already mounted, skipping")
+	} else {
+		log.Debug().Msg("mounting staging path")
+		err = bindMount(to, stagingTargetPath)
+		if err != nil {
+			return nil, status.Error(codes.Internal, fmt.Sprintf("cannot mount staging path %s: %v", stagingTargetPath, err))
+		}
+
+		log.Info().Msg("volume mounted")
+	}
 
 	return &csi.NodeStageVolumeResponse{}, nil
 }
 
-func (ns *nodeServer) NodePublishVolume(ctx context.Context, req *csi.NodePublishVolumeRequest) (*csi.NodePublishVolumeResponse, error) {
+func (d *Driver) NodeUnstageVolume(ctx context.Context, req *csi.NodeUnstageVolumeRequest) (*csi.NodeUnstageVolumeResponse, error) {
+	stagingTargetPath := req.GetStagingTargetPath()
+	log := zerolog.Ctx(ctx).With().Str("targetpath", stagingTargetPath).Logger()
+	log.Trace().Msg("NodeUnstageVolume")
+
+	if err := validateNodeUnstageVolumeRequest(req); err != nil {
+		return nil, status.Error(codes.InvalidArgument, fmt.Errorf("failed to validate NodeUnstageVolumeRequest: %w", err).Error())
+	}
+
+	if err := Unmount(stagingTargetPath); err != nil {
+		log.Warn().Err(err).Str("path", stagingTargetPath).Msg("failed to unmount")
+	}
+
+	if err := os.Remove(stagingTargetPath); err != nil {
+		log.Error().Err(err).Msg("cannot delete staging target path for volume")
+	}
+
+	log.Info().Msg("unmounted volume")
+
+	return &csi.NodeUnstageVolumeResponse{}, nil
+}
+
+// NodePublishVolume is called after NodeStageVolume and used to bind mount a volume
+// from the staging folder into a pod-specific folder
+func (d *Driver) NodePublishVolume(ctx context.Context, req *csi.NodePublishVolumeRequest) (*csi.NodePublishVolumeResponse, error) {
+	log := *zerolog.Ctx(ctx)
 	if err := validateNodePublishVolumeRequest(req); err != nil {
-		glog.Errorf("failed to validate NodePublishVolumeRequest: %v", err)
-		return nil, status.Error(codes.InvalidArgument, err.Error())
+		return nil, status.Error(codes.InvalidArgument, fmt.Errorf("failed to validate NodePublishVolumeRequest: %w", err).Error())
 	}
 
 	// Configuration
 
 	targetPath := req.GetTargetPath()
 	volId := volumeID(req.GetVolumeId())
+	log = log.With().Str("volumeid", string(volId)).Str("targetpath", targetPath).Logger()
 
-	if err := createMountPoint(targetPath); err != nil {
-		glog.Errorf("failed to create mount point for volume %s at %s: %v", volId, targetPath, err)
-		return nil, status.Error(codes.Internal, err.Error())
+	if err := mkdir(targetPath); err != nil {
+		return nil, status.Error(codes.Internal, fmt.Errorf("failed to create mount point for volume: %w", err).Error())
 	}
 
 	// Check if the volume is already mounted
 
-	isMnt, err := isMountPoint(targetPath)
-
+	isMnt, err := folderIsMounted(targetPath)
 	if err != nil {
-		glog.Errorf("stat failed: %v", err)
-		return nil, status.Error(codes.Internal, err.Error())
+		return nil, status.Error(codes.Internal, fmt.Errorf("stat failed: %w", err).Error())
 	}
 
 	if isMnt {
-		glog.Infof("cvmfs: volume %s is already bind-mounted to %s", volId, targetPath)
+		log.Info().Msg("volume is already bind-mounted")
 		return &csi.NodePublishVolumeResponse{}, nil
 	}
 
 	// It's not, bind-mount now
 
 	if err = bindMount(req.GetStagingTargetPath(), targetPath); err != nil {
-		glog.Errorf("failed to bind-mount volume %s to %s: %v", volId, targetPath, err)
-		return nil, status.Error(codes.Internal, err.Error())
+		return nil, status.Error(codes.Internal, fmt.Errorf("failed to bind-mount volume: %w", err).Error())
 	}
 
-	glog.Infof("cvmfs: successfuly bind-mounted volume %s to %s", volId, targetPath)
+	log.Info().Msg("bind-mounted volume")
 
 	return &csi.NodePublishVolumeResponse{}, nil
 }
-
-func (ns *nodeServer) NodeUnpublishVolume(ctx context.Context, req *csi.NodeUnpublishVolumeRequest) (*csi.NodeUnpublishVolumeResponse, error) {
+func (d *Driver) NodeUnpublishVolume(ctx context.Context, req *csi.NodeUnpublishVolumeRequest) (*csi.NodeUnpublishVolumeResponse, error) {
+	log := *zerolog.Ctx(ctx)
 	if err := validateNodeUnpublishVolumeRequest(req); err != nil {
-		glog.Errorf("failed to validate NodeUnpublishVolumeRequest: %v", err)
-		return nil, status.Error(codes.InvalidArgument, err.Error())
+		return nil, status.Error(codes.InvalidArgument, fmt.Errorf("failed to validate NodeUnpublishVolumeRequest: %w", err).Error())
 	}
 
 	targetPath := req.GetTargetPath()
 	volId := volumeID(req.GetVolumeId())
+	log = log.With().Str("volumeid", string(volId)).Str("targetpath", targetPath).Logger()
 
-	// Unbind the volume
-
-	if err := unmountVolume(targetPath); err != nil {
-		glog.Errorf("failed to unbind volume %s: %v", targetPath, err)
-		return nil, status.Error(codes.Internal, err.Error())
+	if _, err := os.Stat(targetPath); os.IsNotExist(err) {
+		log.Warn().Err(err).Str("path", targetPath).Msg("unpublish called on non-existing directory")
+	} else {
+		if err := Unmount(targetPath); err != nil {
+			log.Warn().Err(err).Str("path", targetPath).Msg("failed to unmount")
+		}
+		if err := os.Remove(targetPath); err != nil {
+			log.Error().Err(err).Msg("cannot delete target path for volume")
+		}
 	}
 
-	// Clean up
-
-	if err := os.Remove(targetPath); err != nil {
-		glog.Errorf("cvmfs: cannot delete target path %s for volume %s: %v", targetPath, volId, err)
-	}
-
-	glog.Infof("cvmfs: successfuly unbinded volume %s from %s", volId, targetPath)
+	log.Info().Msg("volume unpublished")
 
 	return &csi.NodeUnpublishVolumeResponse{}, nil
 }
 
-func (ns *nodeServer) NodeUnstageVolume(ctx context.Context, req *csi.NodeUnstageVolumeRequest) (*csi.NodeUnstageVolumeResponse, error) {
-	if err := validateNodeUnstageVolumeRequest(req); err != nil {
-		glog.Errorf("failed to validate NodeUnstageVolumeRequest: %v", err)
-		return nil, status.Error(codes.InvalidArgument, err.Error())
-	}
-
-	stagingTargetPath := req.GetStagingTargetPath()
-	volId := volumeID(req.GetVolumeId())
-
-	// Unmount the volume
-
-	if err := unmountVolume(stagingTargetPath); err != nil {
-		glog.Errorf("failed unmount volume %s: %v", volId, err)
-		return nil, status.Error(codes.Internal, err.Error())
-	}
-
-	// Clean up
-
-	if err := os.Remove(getConfigFilePath(volId)); err != nil {
-		glog.Errorf("cvmfs: cannot remove config for volume %s: %v", volId, err)
-	}
-
-	if err := purgeVolumeCache(volId); err != nil {
-		glog.Errorf("cvmfs: cannot delete cache for volume %s: %v", volId, err)
-	}
-
-	if err := os.Remove(stagingTargetPath); err != nil {
-		glog.Errorf("cvmfs: cannot delete staging target path %s for volume %s: %v", stagingTargetPath, volId, err)
-	}
-
-	glog.Infof("cvmfs: successfuly unmounted volume %s from %s", volId, stagingTargetPath)
-
-	return &csi.NodeUnstageVolumeResponse{}, nil
-}
-
-func (ns *nodeServer) NodeGetCapabilities(ctx context.Context, req *csi.NodeGetCapabilitiesRequest) (*csi.NodeGetCapabilitiesResponse, error) {
+func (d *Driver) NodeGetCapabilities(ctx context.Context, req *csi.NodeGetCapabilitiesRequest) (*csi.NodeGetCapabilitiesResponse, error) {
 	return &csi.NodeGetCapabilitiesResponse{
 		Capabilities: []*csi.NodeServiceCapability{
 			{
@@ -237,4 +273,66 @@ func (ns *nodeServer) NodeGetCapabilities(ctx context.Context, req *csi.NodeGetC
 			},
 		},
 	}, nil
+}
+
+func (d *Driver) NodeGetInfo(ctx context.Context, req *csi.NodeGetInfoRequest) (*csi.NodeGetInfoResponse, error) {
+	return &csi.NodeGetInfoResponse{
+		NodeId: d.config.NodeID,
+	}, nil
+}
+
+func validateNodeStageVolumeRequest(req *csi.NodeStageVolumeRequest) error {
+	if req.GetVolumeCapability() == nil {
+		return fmt.Errorf("volume capability missing in request")
+	}
+
+	if req.GetVolumeId() == "" {
+		return fmt.Errorf("volume ID missing in request")
+	}
+
+	if req.GetStagingTargetPath() == "" {
+		return fmt.Errorf("staging target path missing in request")
+	}
+
+	return nil
+}
+
+func validateNodeUnstageVolumeRequest(req *csi.NodeUnstageVolumeRequest) error {
+	if req.GetVolumeId() == "" {
+		return fmt.Errorf("volume ID missing in request")
+	}
+
+	if req.GetStagingTargetPath() == "" {
+		return fmt.Errorf("staging target path missing in request")
+	}
+
+	return nil
+}
+
+func validateNodePublishVolumeRequest(req *csi.NodePublishVolumeRequest) error {
+	if req.GetVolumeCapability() == nil {
+		return fmt.Errorf("volume capability missing in request")
+	}
+
+	if req.GetVolumeId() == "" {
+		return fmt.Errorf("volume ID missing in request")
+	}
+
+	if req.GetTargetPath() == "" {
+		return fmt.Errorf("target path missing in request")
+	}
+
+	return nil
+}
+
+func validateNodeUnpublishVolumeRequest(req *csi.NodeUnpublishVolumeRequest) error {
+	if req.GetVolumeId() == "" {
+		return fmt.Errorf("volume ID missing in request")
+	}
+
+	if req.GetTargetPath() == "" {
+		return fmt.Errorf("target path missing in request")
+	}
+
+	return nil
 }

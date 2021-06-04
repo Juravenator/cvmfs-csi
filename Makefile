@@ -154,10 +154,13 @@ DOCKER_TAG=${GIT_BRANCH}
 ifneq ($(GIT_TAG),)
 	DOCKER_TAG = ${GIT_TAG}
 endif
+ifeq ($(DOCKER_TAG),master)
+	DOCKER_TAG = latest
+endif
 
 .PHONY: docker
-docker: build-cross
-	sudo docker build -t csi-cvmfsplugin:${DOCKER_TAG} -f deployments/docker/Dockerfile .
+docker:
+	docker build -t juravenator/csi-cvmfsplugin:${DOCKER_TAG} -f Dockerfile .
 
 # ------------------------------------------------------------------------------
 .PHONY: clean
@@ -170,3 +173,6 @@ info:
 	 @echo "Git Tag:           ${GIT_TAG}"
 	 @echo "Git Commit:        ${GIT_COMMIT}"
 	 @echo "Git Tree State:    ${GIT_DIRTY}"
+
+deployments/kubernetes/deploy.yaml: $(shell find deployments/helm/cvmfs-csi -type f -name '*.yaml' -print)
+	helm template -n csi-cvmfs pocket-cvmfs ./deployments/helm/cvmfs-csi > $@

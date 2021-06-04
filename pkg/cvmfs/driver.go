@@ -17,66 +17,79 @@
 package cvmfs
 
 import (
+	"errors"
+
+	"github.com/cernops/cvmfs-csi/internal"
 	"github.com/container-storage-interface/spec/lib/go/csi"
-	"github.com/golang/glog"
-	csicommon "github.com/kubernetes-csi/drivers/pkg/csi-common"
 )
 
-const (
-	PluginFolder = "/var/lib/kubelet/plugins/cvmfs.csi.cern.ch"
-	driverName   = "cvmfs.csi.cern.ch"
-	version      = "1.0.1"
-)
+/*
+Driver handles all relevant CSI gRPC calls for a funcional Identity, Controller, and Node Server
+as described in https://github.com/container-storage-interface/spec/blob/master/spec.md
+*/
+type Driver struct {
+	*csi.UnimplementedIdentityServer
+	*csi.UnimplementedControllerServer
+	*csi.UnimplementedNodeServer
 
-type cvmfsDriver struct {
-	driver   *csicommon.CSIDriver
-	endpoint string
-
-	is *identityServer   //nolint
-	ns *nodeServer       //nolint
-	cs *controllerServer //nolint
-
-	caps   []*csi.VolumeCapability_AccessMode //nolint
-	cscaps []*csi.ControllerServiceCapability //nolint
+	config                 DriverConfig
+	controllerCapabilities []*csi.ControllerServiceCapability
+	VolumeCapabilities     []*csi.VolumeCapability
 }
 
-func NewDriver(nodeID, endpoint string) *cvmfsDriver {
-	glog.Infof("Driver: %v version: %v", driverName, version)
+const DriverVersion = "1.0.1"
 
-	d := &cvmfsDriver{}
-
-	d.endpoint = endpoint
-
-	csiDriver := csicommon.NewCSIDriver(driverName, version, nodeID)
-	csiDriver.AddVolumeCapabilityAccessModes([]csi.VolumeCapability_AccessMode_Mode{csi.VolumeCapability_AccessMode_MULTI_NODE_READER_ONLY})
-	csiDriver.AddControllerServiceCapabilities([]csi.ControllerServiceCapability_RPC_Type{csi.ControllerServiceCapability_RPC_CREATE_DELETE_VOLUME})
-
-	// Create gRPC servers
-
-	d.driver = csiDriver
-
-	return d
+type DriverConfig struct {
+	DriverName  string
+	NodeID      string
+	Endpoint    string
+	Proxy       string
+	CacheFolder string
 }
 
-func NewNodeServer(d *cvmfsDriver) *nodeServer {
-	return &nodeServer{
-		DefaultNodeServer: csicommon.NewDefaultNodeServer(d.driver),
+// NewDriver constructs a new Driver given a valid DriverConfig
+func NewDriver(c DriverConfig) (*Driver, error) {
+	if c.DriverName == "" {
+		return nil, errors.New("Driver name missing")
+	}
+
+	if c.NodeID == "" {
+		return nil, errors.New("NodeID missing")
+	}
+
+	if c.Endpoint == "" {
+		return nil, errors.New("Driver endpoint missing")
+	}
+
+	log := internal.GetLogger("NewDriver")
+	log.Info().Str("driver name", c.DriverName).Str("node ID", c.NodeID).Str("endpoint", c.Endpoint).Msg("new driver")
+	driver := &Driver{config: c}
+	driver.VolumeCapabilities = []*csi.VolumeCapability{mountVolumeCapability(csi.VolumeCapability_AccessMode_MULTI_NODE_READER_ONLY)}
+	driver.controllerCapabilities = []*csi.ControllerServiceCapability{controllerCapability(csi.ControllerServiceCapability_RPC_CREATE_DELETE_VOLUME)}
+	return driver, nil
+}
+
+// Run starts the driver and waits for it to stop.
+// If a driver stopped it signifies something went wrong
+func (d *Driver) Run() {
+	server := &nonBlockingGRPCServer{}
+	server.Start(d.config.Endpoint, d, d, d)
+	server.Wait()
+}
+
+func mountVolumeCapability(mode csi.VolumeCapability_AccessMode_Mode) *csi.VolumeCapability {
+	return &csi.VolumeCapability{
+		AccessType: &csi.VolumeCapability_Mount{Mount: &csi.VolumeCapability_MountVolume{}},
+		AccessMode: &csi.VolumeCapability_AccessMode{Mode: mode},
 	}
 }
 
-func NewControllerServer(d *cvmfsDriver) *controllerServer {
-	return &controllerServer{
-		DefaultControllerServer: csicommon.NewDefaultControllerServer(d.driver),
+func controllerCapability(c csi.ControllerServiceCapability_RPC_Type) *csi.ControllerServiceCapability {
+	return &csi.ControllerServiceCapability{
+		Type: &csi.ControllerServiceCapability_Rpc{
+			Rpc: &csi.ControllerServiceCapability_RPC{
+				Type: c,
+			},
+		},
 	}
-}
-
-func NewIdentityServer(d *cvmfsDriver) *identityServer {
-	return &identityServer{
-		DefaultIdentityServer: csicommon.NewDefaultIdentityServer(d.driver),
-	}
-}
-
-func (d *cvmfsDriver) Run() {
-
-	csicommon.RunControllerandNodePublishServer(d.endpoint, d.driver, NewControllerServer(d), NewNodeServer(d))
 }

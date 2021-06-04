@@ -35,28 +35,36 @@ import (
 	"context"
 
 	"github.com/container-storage-interface/spec/lib/go/csi"
-	"github.com/golang/glog"
-	csicommon "github.com/kubernetes-csi/drivers/pkg/csi-common"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
 
-type identityServer struct {
-	*csicommon.DefaultIdentityServer
-}
+// GetPluginInfo is used by csi-node-driver-registrar to get
+// driver name and version information to report to kubelets
+func (d *Driver) GetPluginInfo(ctx context.Context, req *csi.GetPluginInfoRequest) (*csi.GetPluginInfoResponse, error) {
+	if d.config.DriverName == "" {
+		return nil, status.Error(codes.Unavailable, "Driver name not configured")
+	}
 
-func (ids *identityServer) GetPluginInfo(ctx context.Context, req *csi.GetPluginInfoRequest) (*csi.GetPluginInfoResponse, error) {
-	glog.V(5).Infof("Using default GetPluginInfo")
+	if DriverVersion == "" {
+		return nil, status.Error(codes.Unavailable, "Driver is missing version")
+	}
 
 	return &csi.GetPluginInfoResponse{
-		Name:          driverName,
-		VendorVersion: version,
+		Name:          d.config.DriverName,
+		VendorVersion: DriverVersion,
 	}, nil
 }
 
-func (ids *identityServer) Probe(ctx context.Context, req *csi.ProbeRequest) (*csi.ProbeResponse, error) {
+// Probe is used by the livenessprobe sidecar to serve
+// liveness checks
+func (d *Driver) Probe(ctx context.Context, req *csi.ProbeRequest) (*csi.ProbeResponse, error) {
 	return &csi.ProbeResponse{}, nil
 }
 
-func (is *identityServer) GetPluginCapabilities(ctx context.Context, req *csi.GetPluginCapabilitiesRequest) (*csi.GetPluginCapabilitiesResponse, error) {
+// GetPluginCapabilities is used by csi-node-driver-registrar to
+// report to kubelet what CSI calls are appropriate for this driver
+func (d *Driver) GetPluginCapabilities(ctx context.Context, req *csi.GetPluginCapabilitiesRequest) (*csi.GetPluginCapabilitiesResponse, error) {
 	return &csi.GetPluginCapabilitiesResponse{
 		Capabilities: []*csi.PluginCapability{
 			{

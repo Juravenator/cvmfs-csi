@@ -18,38 +18,34 @@ package main
 
 import (
 	"flag"
-	"os"
-	"path"
 
+	"github.com/cernops/cvmfs-csi/internal"
 	"github.com/cernops/cvmfs-csi/pkg/cvmfs"
-	"github.com/golang/glog"
 )
 
-func init() {
-	_ = flag.Set("logtostderr", "true")
-}
-
 var (
-	endpoint   = flag.String("endpoint", "unix://tmp/csi.sock", "CSI endpoint")
-	driverName = flag.String("drivername", "csi-cvmfs", "name of the driver") //nolint
-	nodeId     = flag.String("nodeid", "", "node id")
+	config   = cvmfs.DriverConfig{}
+	logLevel = flag.String("log.level", "info", "log level")
+	logMode  = flag.String("log.mode", "plain", "log mode (plain|json)")
 )
 
 func main() {
+	flag.StringVar(&config.Endpoint, "csi-address", "unix:///csi/csi.sock", "CSI socket address to share with helper sidecar containers (e.g. csi-attacher)")
+	flag.StringVar(&config.DriverName, "drivername", "cvmfs.csi.cern.ch", "name of the driver. To be used as 'provisioner' for K8S StorageClasses")
+	flag.StringVar(&config.Proxy, "cvmfs-proxy", "http://ca-proxy.cern.ch:3128", "proxy to use for CVMFS mounts")
+	flag.StringVar(&config.CacheFolder, "cache-folder", "/var/cache/cvmfs", "cache location to use for CVMFS mounts")
+	flag.StringVar(&config.NodeID, "nodeid", "", "name of the node this runs on (recommended to use spec.nodeName in your statefulset/deployment)")
 	flag.Parse()
+	internal.InitLogging(*logLevel, *logMode)
 
-	if err := os.MkdirAll(path.Join(cvmfs.PluginFolder, "controller"), 0755); err != nil {
-		glog.Errorf("failed to create persistent storage for controller: %v", err)
-		os.Exit(1)
+	log := internal.GetLogger("")
+	log.Info().Msg("starting")
+
+	driver, err := cvmfs.NewDriver(config)
+	if err != nil {
+		log.Fatal().Err(err).Msg("driver start failed")
 	}
 
-	if err := os.MkdirAll(path.Join(cvmfs.PluginFolder, "node"), 0755); err != nil {
-		glog.Errorf("failed to create persistent storage for node: %v", err)
-		os.Exit(1)
-	}
-
-	driver := cvmfs.NewDriver(*nodeId, *endpoint)
 	driver.Run()
-
-	os.Exit(0)
+	log.Warn().Msg("finished")
 }

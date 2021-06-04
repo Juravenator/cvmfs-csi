@@ -15,30 +15,38 @@
 //
 package cvmfs
 
+// see doc.go for a more holistic view of what the methods in this file do
+
 import (
 	"context"
+	"fmt"
 
-	"github.com/golang/glog"
+	"github.com/cernops/cvmfs-csi/internal"
+	"github.com/container-storage-interface/spec/lib/go/csi"
+	"github.com/google/uuid"
+	"github.com/rs/zerolog"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
-
-	"github.com/container-storage-interface/spec/lib/go/csi"
-	csicommon "github.com/kubernetes-csi/drivers/pkg/csi-common"
 )
 
-type controllerServer struct {
-	*csicommon.DefaultControllerServer
+type volumeID string
+
+func newVolumeID() volumeID {
+	return volumeID("csi-cvmfs-" + uuid.New().String())
 }
 
-func (cs *controllerServer) CreateVolume(ctx context.Context, req *csi.CreateVolumeRequest) (*csi.CreateVolumeResponse, error) {
-	if err := cs.validateCreateVolumeRequest(req); err != nil {
-		glog.Errorf("failed to validate CreateVolumeRequest: %v", err)
-		return nil, status.Error(codes.InvalidArgument, err.Error())
+// CreateVolume is called in response to the creation of a PersistentVolumeClaim
+// For CVMFS, this is a NOP, and the volume only serves an administrative purpose
+func (d *Driver) CreateVolume(ctx context.Context, req *csi.CreateVolumeRequest) (*csi.CreateVolumeResponse, error) {
+	log := zerolog.Ctx(ctx)
+	err := d.validateCreateVolumeRequest(req)
+	if err != nil {
+		return nil, status.Error(codes.InvalidArgument, fmt.Errorf("invalid CreateVolumeRequest: %w", err).Error())
 	}
 
 	volId := newVolumeID()
 
-	glog.Infof("cvmfs: successfuly created volume %s", volId)
+	log.Info().Str("volumeid", string(volId)).Msg("new volume created")
 
 	return &csi.CreateVolumeResponse{
 		Volume: &csi.Volume{
@@ -49,38 +57,93 @@ func (cs *controllerServer) CreateVolume(ctx context.Context, req *csi.CreateVol
 	}, nil
 }
 
-func (cs *controllerServer) DeleteVolume(ctx context.Context, req *csi.DeleteVolumeRequest) (*csi.DeleteVolumeResponse, error) {
-	if err := cs.validateDeleteVolumeRequest(req); err != nil {
-		glog.Errorf("failed to validate DeleteVolumeRequest: %v", err)
-		return nil, status.Error(codes.InvalidArgument, err.Error())
+// DeleteVolume is called in response to the deletion of the PersistentVolumeClaim
+// responsible for the creation of this Volume
+func (d *Driver) DeleteVolume(ctx context.Context, req *csi.DeleteVolumeRequest) (*csi.DeleteVolumeResponse, error) {
+	log := zerolog.Ctx(ctx).With().Str("volumeid", req.GetVolumeId()).Logger()
+	if err := d.validateDeleteVolumeRequest(req); err != nil {
+		return nil, status.Error(codes.InvalidArgument, fmt.Errorf("cannot validate DeleteVolumeRequest: %w", err).Error())
 	}
 
-	glog.Infof("cvmfs: successfuly deleted volume %s", req.GetVolumeId())
+	log.Info().Msg("deleted volume")
 
 	return &csi.DeleteVolumeResponse{}, nil
 }
 
-func (cs *controllerServer) ValidateVolumeCapabilities(
-	ctx context.Context,
-	req *csi.ValidateVolumeCapabilitiesRequest,
-) (*csi.ValidateVolumeCapabilitiesResponse, error) {
-	for _, c := range req.GetVolumeCapabilities() {
-		if c.AccessMode.GetMode() != csi.VolumeCapability_AccessMode_MULTI_NODE_READER_ONLY || c.GetBlock() != nil {
-			return nil, status.Error(codes.Unimplemented, "")
-		}
-	}
+// ControllerGetCapabilities is used to communicate driver capabilities
+// This CVMFS driver supports only mounting, and not other features
+// like snapshots or clones.
+func (d *Driver) ControllerGetCapabilities(ctx context.Context, req *csi.ControllerGetCapabilitiesRequest) (*csi.ControllerGetCapabilitiesResponse, error) {
 
-	supportedAccessMode := &csi.VolumeCapability_AccessMode{
-		Mode: csi.VolumeCapability_AccessMode_MULTI_NODE_READER_ONLY,
+	return &csi.ControllerGetCapabilitiesResponse{Capabilities: d.controllerCapabilities}, nil
+}
+
+// ValidateVolumeCapabilities is used to verify that Kubernetes is creating
+// volumes that this driver actually understands
+// For this CVMFS driver, this means that we want to deal with volumes
+// that represent readonly block storage
+func (d *Driver) ValidateVolumeCapabilities(ctx context.Context, req *csi.ValidateVolumeCapabilitiesRequest) (*csi.ValidateVolumeCapabilitiesResponse, error) {
+	if err := d.validateVolumeCapabilities(req.VolumeCapabilities); err != nil {
+		return nil, status.Error(codes.Unimplemented, err.Error())
 	}
 
 	return &csi.ValidateVolumeCapabilitiesResponse{
 		Confirmed: &csi.ValidateVolumeCapabilitiesResponse_Confirmed{
-			VolumeCapabilities: []*csi.VolumeCapability{
-				{
-					AccessMode: supportedAccessMode,
-				},
-			},
+			VolumeCapabilities: d.VolumeCapabilities,
 		},
 	}, nil
+}
+
+func (d *Driver) validateVolumeCapabilities(capabilities []*csi.VolumeCapability) error {
+	log := internal.GetLogger("validateVolumeCapabilities")
+	if capabilities == nil {
+		return fmt.Errorf("volume capabilities cannot be empty")
+	}
+	for _, c := range capabilities {
+		log.Trace().Interface("requestedVolumeCapability", c).Msg("checking if we can serve this volume capability")
+		match := false
+		for _, volumeCapability := range d.VolumeCapabilities {
+			modeMatch := c.AccessMode.GetMode() == volumeCapability.AccessMode.GetMode()
+
+			// validating a typematch is a bit icky given the wacko way it's implemented
+			typeMatch := false
+			ct := c.GetAccessType()
+			vt := volumeCapability.GetAccessType()
+			if ct == nil || vt == nil {
+				typeMatch = ct == vt
+			} else if _, ok := ct.(*csi.VolumeCapability_Mount); ok {
+				_, ok = vt.(*csi.VolumeCapability_Mount)
+				typeMatch = ok
+			} else if _, ok := ct.(*csi.VolumeCapability_Block); ok {
+				_, ok = vt.(*csi.VolumeCapability_Block)
+				typeMatch = ok
+			}
+			log.Trace().Interface("driverVolumeCapability", volumeCapability).Bool("modematch", modeMatch).Bool("typematch", typeMatch).Msg("checking with this supported capability")
+			if modeMatch && typeMatch {
+				match = true
+			}
+		}
+		if !match {
+			return fmt.Errorf("invalid volume access mode '%s' type '%s'", c.AccessMode, c.AccessType)
+		}
+	}
+	return nil
+}
+
+func (d *Driver) validateCreateVolumeRequest(req *csi.CreateVolumeRequest) error {
+	if req.GetName() == "" {
+		return fmt.Errorf("volume name cannot be empty")
+	}
+
+	if err := d.validateVolumeCapabilities(req.VolumeCapabilities); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (d *Driver) validateDeleteVolumeRequest(req *csi.DeleteVolumeRequest) error {
+	if req.VolumeId == "" {
+		return fmt.Errorf("volume ID cannot be empty")
+	}
+	return nil
 }
